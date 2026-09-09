@@ -14,6 +14,7 @@ Steps:
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -54,6 +55,61 @@ def get_audio_tracks_info(video_path: Path) -> list[dict]:
         return [s for s in data.get("streams", []) if s.get("codec_type", "audio") == "audio" or "channels" in s]
     except Exception:
         return []
+
+
+def get_hardware_profile(
+    custom_whisper_threads: int | None = None,
+    custom_ffmpeg_threads: int | None = None,
+    custom_speaker_workers: int | None = None,
+    custom_hwaccel: str | None = None
+) -> dict:
+    """Detect available CPU threads and hardware acceleration options.
+    Budgets threads to avoid oversubscription and thermal/power throttling on 15W CPUs:
+    - 8 logical threads (e.g. i3-1215U / 6 cores): 4 for Whisper (P-cores), 2 for FFmpeg (E-cores), 2 for OS.
+    - 6 logical threads: 3 for Whisper, 2 for FFmpeg, 1 for OS.
+    - <=4 logical threads: 2 for Whisper, 1 for FFmpeg, 1 for OS.
+    """
+    cpu_count = os.cpu_count() or 4
+
+    if cpu_count >= 8:
+        default_whisper = 4
+        default_ffmpeg = 2
+        default_speakers = 3
+    elif cpu_count >= 6:
+        default_whisper = 3
+        default_ffmpeg = 2
+        default_speakers = 2
+    else:
+        default_whisper = max(1, cpu_count - 1)
+        default_ffmpeg = 1
+        default_speakers = 2
+
+    whisper_threads = custom_whisper_threads if (custom_whisper_threads and custom_whisper_threads > 0) else default_whisper
+    ffmpeg_threads = custom_ffmpeg_threads if (custom_ffmpeg_threads and custom_ffmpeg_threads > 0) else default_ffmpeg
+    speaker_workers = custom_speaker_workers if (custom_speaker_workers and custom_speaker_workers > 0) else default_speakers
+
+    # Hardware acceleration detection for FFmpeg video decoding
+    hwaccel = None
+    if custom_hwaccel and custom_hwaccel.lower() != "auto":
+        hwaccel = None if custom_hwaccel.lower() == "none" else custom_hwaccel
+    else:
+        try:
+            res = subprocess.run(["ffmpeg", "-hwaccels"], capture_output=True, text=True)
+            out = res.stdout.lower()
+            for method in ["d3d11va", "dxva2", "qsv"]:
+                if method in out:
+                    hwaccel = method
+                    break
+        except Exception:
+            hwaccel = None
+
+    return {
+        "cpu_count": cpu_count,
+        "whisper_threads": whisper_threads,
+        "ffmpeg_threads": ffmpeg_threads,
+        "speaker_workers": speaker_workers,
+        "hwaccel": hwaccel,
+    }
 
 
 def format_timestamp(seconds: float) -> str:
@@ -302,14 +358,15 @@ def extract_audio(
     }
 
 
-def transcribe_audio(audio_files: dict, bundle_dir: Path, model_size: str = "large-v3") -> list[dict]:
+def transcribe_audio(audio_files: dict, bundle_dir: Path, model_size: str = "large-v3", cpu_threads: int | None = None) -> list[dict]:
     """Transcribe audio using faster-whisper on CPU with int8 quantization.
     Supports multi-track transcription with isolated Host vs Remote channels and VAD filtering.
     """
     if model_size == "large":
         model_size = "large-v3"
     print("[3/5] TRANSCRIBING SPEECH WITH FASTER-WHISPER")
-    print(f"      -> Engine: faster-whisper | Model: '{model_size}' | Quantization: int8 (CPU)")
+    thread_info = f" | CPU Threads: {cpu_threads}" if cpu_threads else ""
+    print(f"      -> Engine: faster-whisper | Model: '{model_size}' | Quantization: int8 (CPU){thread_info}")
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -318,7 +375,10 @@ def transcribe_audio(audio_files: dict, bundle_dir: Path, model_size: str = "lar
     print(f"      -> Initializing Whisper '{model_size}' (downloads automatically on first run)...")
     sys.stdout.flush()
     t_load = time.time()
-    model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    whisper_kwargs = {"device": "cpu", "compute_type": "int8"}
+    if cpu_threads and cpu_threads > 0:
+        whisper_kwargs["cpu_threads"] = cpu_threads
+    model = WhisperModel(model_size, **whisper_kwargs)
     print(f"      -> Model loaded in {time.time() - t_load:.2f}s.")
 
     t0 = time.time()
@@ -440,20 +500,46 @@ def transcribe_audio(audio_files: dict, bundle_dir: Path, model_size: str = "lar
     return all_turns
 
 
-def extract_slide_frames(video_path: Path, slides_dir: Path) -> list[Path]:
+def extract_slide_frames(
+    video_path: Path,
+    slides_dir: Path,
+    hwaccel: str | None = None,
+    threads: int | None = None
+) -> list[Path]:
     """Extract slide/screen change frames using scene detection (ADR-0001)."""
     print("      [Tier 1: Presentation Slides]")
-    print("      -> Analyzing scene transitions with FFmpeg filter (gt(scene, 0.05))...")
+    accel_str = f" | HWAccel: {hwaccel}" if hwaccel else ""
+    thread_str = f" | Threads: {threads}" if threads else ""
+    print(f"      -> Analyzing scene transitions with FFmpeg filter (gt(scene, 0.05)){accel_str}{thread_str}...")
     t0 = time.time()
     temp_pattern = slides_dir / "temp_slide_%04d.jpg"
-    cmd = [
-        "ffmpeg", "-y",
+    cmd = ["ffmpeg", "-y"]
+    if hwaccel:
+        cmd.extend(["-hwaccel", hwaccel])
+    if threads and threads > 0:
+        cmd.extend(["-threads", str(threads)])
+    cmd.extend([
         "-i", str(video_path),
         "-vf", "select=eq(n\\,0)+gt(scene\\,0.05),showinfo",
         "-fps_mode", "vfr",
         str(temp_pattern)
-    ]
+    ])
     proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Graceful fallback: if hwaccel failed on unusual video encoding, retry with software
+    if proc.returncode != 0 and hwaccel:
+        print(f"      -> Note: HWAccel '{hwaccel}' encountered issue. Retrying with software decoder...")
+        cmd_fallback = ["ffmpeg", "-y"]
+        if threads and threads > 0:
+            cmd_fallback.extend(["-threads", str(threads)])
+        cmd_fallback.extend([
+            "-i", str(video_path),
+            "-vf", "select=eq(n\\,0)+gt(scene\\,0.05),showinfo",
+            "-fps_mode", "vfr",
+            str(temp_pattern)
+        ])
+        proc = subprocess.run(cmd_fallback, capture_output=True, text=True)
+
     pts_matches = re.findall(r"pts_time:([0-9\.]+)", proc.stderr)
 
     temp_files = sorted(slides_dir.glob("temp_slide_*.jpg"))
@@ -492,15 +578,20 @@ def extract_slide_frames(video_path: Path, slides_dir: Path) -> list[Path]:
     return renamed_files
 
 
-def extract_speaker_frames(video_path: Path, speakers_dir: Path, speech_turns: list[dict]) -> list[Path]:
+def extract_speaker_frames(
+    video_path: Path,
+    speakers_dir: Path,
+    speech_turns: list[dict],
+    max_workers: int = 3
+) -> list[Path]:
     """Extract speaker snapshot at each speech turn onset to isolate active speaker indicators (ADR-0001)."""
     print("      [Tier 2: Speaker Keyframes]")
     candidates = []
-    last_pts = -10.0
+    last_pts = None
     for turn in speech_turns:
         start_sec = turn["start"]
         # Deduplicate to sample approximately every 15+ seconds to prevent frame bloat
-        if start_sec - last_pts >= 15.0:
+        if last_pts is None or (start_sec - last_pts >= 15.0):
             candidates.append(turn)
             last_pts = start_sec
 
@@ -510,15 +601,16 @@ def extract_speaker_frames(video_path: Path, speakers_dir: Path, speech_turns: l
         step = len(candidates) / MAX_SPEAKER_FRAMES
         candidates = [candidates[int(i * step)] for i in range(MAX_SPEAKER_FRAMES)]
 
-    print(f"      -> Sampling speaker video tiles for {len(candidates)} speech turn onsets...")
+    total_candidates = len(candidates)
+    worker_info = f" | Concurrent Workers: {max_workers}" if max_workers > 1 else ""
+    print(f"      -> Sampling speaker video tiles for {total_candidates} speech turn onsets{worker_info}...")
     t0 = time.time()
     extracted_frames = []
 
-    for idx, turn in enumerate(candidates, 1):
+    def _extract_one(idx: int, turn: dict) -> tuple[int, Path | None]:
         start_sec = turn["start"]
         ts = format_timestamp(start_sec)
         frame_path = speakers_dir / f"speaker_{ts}.jpg"
-
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(start_sec),
@@ -529,16 +621,106 @@ def extract_speaker_frames(video_path: Path, speakers_dir: Path, speech_turns: l
         ]
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode == 0 and frame_path.is_file():
-            extracted_frames.append(frame_path)
+            return idx, frame_path
+        return idx, None
 
-        pct = (idx / len(candidates)) * 100.0
-        sys.stdout.write(f"\n      -> Progress: [{idx}/{len(candidates)}] ({pct:5.1f}%) | Captured: speaker_{ts}.jpg")
-        sys.stdout.flush()
+    if max_workers > 1 and total_candidates > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_turn = {
+                executor.submit(_extract_one, idx, turn): (idx, turn)
+                for idx, turn in enumerate(candidates, 1)
+            }
+            completed_count = 0
+            for future in concurrent.futures.as_completed(future_to_turn):
+                completed_count += 1
+                idx, frame_path = future.result()
+                if frame_path:
+                    extracted_frames.append(frame_path)
+                pct = (completed_count / total_candidates) * 100.0
+                sys.stdout.write(f"\n      -> Progress: [{completed_count}/{total_candidates}] ({pct:5.1f}%) | Workers Active: {max_workers}")
+                sys.stdout.flush()
+    else:
+        for idx, turn in enumerate(candidates, 1):
+            _, frame_path = _extract_one(idx, turn)
+            if frame_path:
+                extracted_frames.append(frame_path)
+            pct = (idx / total_candidates) * 100.0
+            sys.stdout.write(f"\n      -> Progress: [{idx}/{total_candidates}] ({pct:5.1f}%)")
+            sys.stdout.flush()
 
     sys.stdout.write("\n")
+    extracted_frames.sort(key=lambda p: p.name)
     elapsed = time.time() - t0
     print(f"      -> Extracted {len(extracted_frames)} speaker keyframes in {elapsed:.1f}s.\n")
     return extracted_frames
+
+
+def extract_artifacts_parallel(
+    session_video: Path,
+    bundle_dir: Path,
+    audio_files: dict,
+    model_size: str,
+    profile: dict,
+    extract_1fps: bool = False
+) -> list[dict]:
+    """Execute Tier 1 visual extraction and audio transcription concurrently.
+    Allocates distinct CPU cores and GPU media engines to prevent bottlenecks.
+    """
+    slides_dir = bundle_dir / "slides"
+    speakers_dir = bundle_dir / "speakers"
+
+    print("========================================================================")
+    print("           CONCURRENT PIPELINE EXECUTION (HARDWARE-OPTIMIZED)")
+    print("========================================================================")
+    print(f" [*] CPU Logical Cores      : {profile['cpu_count']}")
+    print(f" [*] Whisper CPU Threads    : {profile['whisper_threads']} (Allocated)")
+    print(f" [*] FFmpeg Video Threads   : {profile['ffmpeg_threads']} (Allocated)")
+    print(f" [*] Video HW Acceleration  : {profile['hwaccel'] or 'Software'}")
+    print(f" [*] Speaker Worker Pool    : {profile['speaker_workers']} workers")
+    print("========================================================================\n")
+
+    t_parallel_start = time.time()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        # 1. Launch Tier 1 Slide Frame Extraction in background thread
+        print("[Parallel Stage 1/2] Spawning Tier 1 Slide Extraction in background...")
+        slide_future = executor.submit(
+            extract_slide_frames,
+            session_video,
+            slides_dir,
+            profile["hwaccel"],
+            profile["ffmpeg_threads"]
+        )
+
+        # 2. Run Audio Transcription in parallel on allocated Whisper threads
+        print("[Parallel Stage 1/2] Starting Speech Transcription on dedicated threads...")
+        speech_turns = transcribe_audio(
+            audio_files,
+            bundle_dir,
+            model_size=model_size,
+            cpu_threads=profile["whisper_threads"]
+        )
+
+    # 3. Transcription finished -> Start Tier 2 Speaker Keyframes concurrently
+    print("[Parallel Stage 2/2] Transcription complete. Launching Tier 2 Speaker Keyframe extraction...")
+    extract_speaker_frames(
+        session_video,
+        speakers_dir,
+        speech_turns,
+        max_workers=profile["speaker_workers"]
+    )
+
+    # 4. Wait for Tier 1 Slide Extraction future
+    slide_frames = slide_future.result()
+    print(f"      -> Tier 1 Slide Extraction confirmed ready ({len(slide_frames)} slides).")
+
+    # 5. Optional 1fps extraction if requested
+    if extract_1fps:
+        extract_all_1fps_frames(session_video, bundle_dir)
+
+    total_parallel_time = time.time() - t_parallel_start
+    print(f"\n[+] Concurrent preprocessing completed in {total_parallel_time:.1f}s.\n")
+    return speech_turns
 
 
 def extract_all_1fps_frames(video_path: Path, bundle_dir: Path) -> None:
@@ -752,6 +934,11 @@ def main():
     parser.add_argument("--host-track", type=int, default=3, help="OBS audio track number for local host mic (default: 3, 1-indexed)")
     parser.add_argument("--master-track", type=int, default=1, help="OBS audio track number for master mix (default: 1, 1-indexed)")
     parser.add_argument("--disable-multi-track", action="store_true", help="Force single-track audio extraction even if multiple tracks exist")
+    parser.add_argument("--sequential", action="store_true", help="Force sequential extraction instead of parallel execution")
+    parser.add_argument("--whisper-threads", type=int, default=None, help="Explicit CPU threads for faster-whisper (default: auto-budgeted)")
+    parser.add_argument("--ffmpeg-threads", type=int, default=None, help="Explicit CPU threads for FFmpeg scene detection (default: auto-budgeted)")
+    parser.add_argument("--speaker-workers", type=int, default=None, help="Concurrent worker threads for speaker frame extraction (default: auto-budgeted)")
+    parser.add_argument("--hwaccel", default="auto", choices=["auto", "d3d11va", "dxva2", "qsv", "none"], help="FFmpeg video decode hardware acceleration (default: auto)")
 
     args = parser.parse_args()
 
@@ -759,6 +946,13 @@ def main():
     recordings_dir = Path(args.recordings_dir).resolve()
     bundle_dir = (project_root / args.bundle_dir).resolve()
     output_dir = (project_root / args.output_dir).resolve()
+
+    profile = get_hardware_profile(
+        custom_whisper_threads=args.whisper_threads,
+        custom_ffmpeg_threads=args.ffmpeg_threads,
+        custom_speaker_workers=args.speaker_workers,
+        custom_hwaccel=args.hwaccel
+    )
 
     video_paths = find_source_videos(args.video_paths, recordings_dir)
     total_size_mb = sum(p.stat().st_size for p in video_paths) / (1024 * 1024)
@@ -779,6 +973,7 @@ def main():
     print(f" [TIME]   Total Length : {format_timestamp_colons(total_duration_sec)} ({total_duration_sec:.1f}s)")
     print(f" [DIR]    Artifacts    : {bundle_dir}")
     print(f" [DEST]   MoM Output   : {output_dir}")
+    print(f" [MODE]   Execution    : {'Sequential' if args.sequential else 'Parallel (Hardware-Optimized)'}")
     print("========================================================================\n")
 
     if args.synthesis_only:
@@ -787,22 +982,36 @@ def main():
         invoke_antigravity(session_video, bundle_dir, output_dir)
         return
 
-    # 1-3. Bundle, Audio, Transcription
+    slides_dir = bundle_dir / "slides"
+    speakers_dir = bundle_dir / "speakers"
+
+    # 1-4. Bundle, Audio, Transcription & Visual Extraction
     cached_transcript = bundle_dir / "transcript.json"
     if args.reuse_transcript and cached_transcript.is_file():
         print("[1/5] ARTIFACT BUNDLE: Reusing cached transcript and media (--reuse-transcript).\n")
-        (bundle_dir / "slides").mkdir(parents=True, exist_ok=True)
-        (bundle_dir / "speakers").mkdir(parents=True, exist_ok=True)
+        slides_dir.mkdir(parents=True, exist_ok=True)
+        speakers_dir.mkdir(parents=True, exist_ok=True)
         session_video = bundle_dir / "merged_session.mp4" if (bundle_dir / "merged_session.mp4").is_file() else video_paths[0]
-        audio_wav = bundle_dir / "audio.wav"
         print("[2/5] AUDIO EXTRACTION: Cached audio found.\n")
         print("[3/5] TRANSCRIPTION: Loading cached transcript.json...")
         with open(cached_transcript, "r", encoding="utf-8") as f:
             speech_turns = json.load(f)
         print(f"      -> Loaded {len(speech_turns)} speech turns from cache.\n")
+
+        print("[4/5] EXTRACTING VISUAL ARTIFACTS (TWO-TIER)")
+        if not args.sequential:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                slide_future = executor.submit(extract_slide_frames, session_video, slides_dir, profile["hwaccel"], profile["ffmpeg_threads"])
+                extract_speaker_frames(session_video, speakers_dir, speech_turns, max_workers=profile["speaker_workers"])
+                slide_future.result()
+        else:
+            extract_slide_frames(session_video, slides_dir, hwaccel=profile["hwaccel"], threads=profile["ffmpeg_threads"])
+            extract_speaker_frames(session_video, speakers_dir, speech_turns, max_workers=1)
+
+        if args.extract_1fps:
+            extract_all_1fps_frames(session_video, bundle_dir)
     else:
         clean_bundle_directory(bundle_dir)
-        # Lossless merge if multiple split files exist
         session_video = merge_split_recordings(video_paths, bundle_dir)
         audio_tracks = get_audio_tracks_info(session_video)
         audio_files = extract_audio(
@@ -814,17 +1023,29 @@ def main():
             master_track=args.master_track,
             disable_multi_track=args.disable_multi_track
         )
-        speech_turns = transcribe_audio(audio_files, bundle_dir, model_size=args.model)
 
-    # 4. Visual Context Extraction
-    print("[4/5] EXTRACTING VISUAL ARTIFACTS (TWO-TIER)")
-    slides_dir = bundle_dir / "slides"
-    speakers_dir = bundle_dir / "speakers"
-    extract_slide_frames(session_video, slides_dir)
-    extract_speaker_frames(session_video, speakers_dir, speech_turns)
-
-    if args.extract_1fps:
-        extract_all_1fps_frames(session_video, bundle_dir)
+        if args.sequential:
+            print("[*] Mode: Sequential Execution (--sequential passed).\n")
+            speech_turns = transcribe_audio(
+                audio_files,
+                bundle_dir,
+                model_size=args.model,
+                cpu_threads=profile["whisper_threads"]
+            )
+            print("[4/5] EXTRACTING VISUAL ARTIFACTS (TWO-TIER)")
+            extract_slide_frames(session_video, slides_dir, hwaccel=profile["hwaccel"], threads=profile["ffmpeg_threads"])
+            extract_speaker_frames(session_video, speakers_dir, speech_turns, max_workers=1)
+            if args.extract_1fps:
+                extract_all_1fps_frames(session_video, bundle_dir)
+        else:
+            speech_turns = extract_artifacts_parallel(
+                session_video,
+                bundle_dir,
+                audio_files,
+                model_size=args.model,
+                profile=profile,
+                extract_1fps=args.extract_1fps
+            )
 
     print("----------------------- Preprocessing Summary -----------------------")
     print(f"Artifacts ready in: {bundle_dir}")

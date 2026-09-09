@@ -296,6 +296,8 @@ If you record your meetings using **OBS Studio**, you can optionally configure a
 | Goal | How to do it |
 | :--- | :--- |
 | **Make transcription run faster on older PCs** | Add `--model base` or `--model tiny`:<br>`python process_meeting.py --model base` |
+| **Force sequential mode (if debugging)** | Add `--sequential`:<br>`python process_meeting.py --sequential` |
+| **Custom CPU thread allocation** | Customize Whisper or FFmpeg threads:<br>`python process_meeting.py --whisper-threads 4 --ffmpeg-threads 2` |
 | **Change the recordings folder** | If your videos are in a different folder:<br>`python process_meeting.py --recordings-dir "C:\MyRecordings"` |
 | **Re-run AI summary without waiting to transcribe again** | If you already transcribed a video and just want to re-generate the notes:<br>`python process_meeting.py --reuse-transcript` |
 | **Only run the AI step** | Skip all media cutting and jump straight to writing:<br>`python process_meeting.py --synthesis-only` |
