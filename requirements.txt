@@ -1,0 +1,2 @@
+# Requirements for MoM (Minutes of Meeting) Processing Pipeline
+faster-whisper>=1.0.0

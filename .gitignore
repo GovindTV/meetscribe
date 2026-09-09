@@ -1,0 +1,20 @@
+﻿# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary artifact bundle from processing runs
+.bundle/
+
+# Local agent scratch & temporary tracking
+.scratch/
+.temp/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# OS metadata
+.DS_Store
+Thumbs.db
