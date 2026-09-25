@@ -358,15 +358,102 @@ def extract_audio(
     }
 
 
-def transcribe_audio(audio_files: dict, bundle_dir: Path, model_size: str = "large-v3", cpu_threads: int | None = None) -> list[dict]:
+def get_default_glossary_template(client_id: str = "default") -> dict:
+    """Return starter template for client glossary profile."""
+    return {
+        "client_id": client_id,
+        "display_name": "Default Client",
+        "description": "Client domain terminology and proprietary acronyms.",
+        "terms": [
+            {
+                "canonical": "ExampleTerm",
+                "description": "Description of what this system, project, or domain term represents."
+            }
+        ],
+        "hotwords": [
+            "ExampleHotword"
+        ]
+    }
+
+
+def load_client_glossary(client_name: str | None, clients_dir: Path) -> tuple[dict | None, Path | None]:
+    """Load client glossary JSON file. If default profile is requested but missing,
+    auto-scaffolds a starter template.
+    """
+    if not client_name:
+        return None, None
+
+    clients_dir.mkdir(parents=True, exist_ok=True)
+    glossary_path = clients_dir / f"{client_name}.json"
+
+    if not glossary_path.is_file():
+        if client_name == "default":
+            template = get_default_glossary_template("default")
+            with open(glossary_path, "w", encoding="utf-8") as f:
+                json.dump(template, f, indent=2)
+            print(f"[*] CLIENT GLOSSARY: Auto-scaffolded starter profile at '{glossary_path.as_posix()}'.")
+            print(f"    -> Add your client's proprietary terms to this file to bias Whisper and MoM synthesis.\n")
+            return template, glossary_path
+        else:
+            print(f"[!] Warning: Client profile '{client_name}' not found at '{glossary_path}'. Proceeding without client glossary.\n")
+            return None, None
+
+    try:
+        with open(glossary_path, "r", encoding="utf-8") as f:
+            glossary = json.load(f)
+        terms_count = len(glossary.get("terms", []))
+        hotwords_count = len(glossary.get("hotwords", []))
+        display_name = glossary.get("display_name", client_name)
+        print(f"[*] CLIENT GLOSSARY: Loaded '{display_name}' ({glossary_path.name})")
+        print(f"    -> {terms_count} canonical terms, {hotwords_count} hotwords loaded for decoder biasing & synthesis grounding.\n")
+        return glossary, glossary_path
+    except Exception as e:
+        print(f"[!] Warning: Failed to parse client profile '{glossary_path}': {e}. Proceeding without client glossary.\n")
+        return None, None
+
+
+def build_whisper_biasing_params(glossary: dict | None) -> tuple[str | None, str | None]:
+    """Compile canonical terms and hotwords into Whisper decoder biasing parameters."""
+    if not glossary:
+        return None, None
+
+    terms = [t["canonical"].strip() for t in glossary.get("terms", []) if isinstance(t, dict) and t.get("canonical")]
+    hotwords_list = [h.strip() for h in glossary.get("hotwords", []) if isinstance(h, str) and h.strip()]
+
+    all_terms = list(dict.fromkeys(terms + hotwords_list))
+    if not all_terms:
+        return None, None
+
+    # Format initial_prompt context sentence (keeping within Whisper's ~224 token limit)
+    terms_sample = ", ".join(all_terms[:40])
+    initial_prompt = f"Meeting discussion covering client domain terminology: {terms_sample}."
+
+    # Native hotwords argument in faster-whisper (space-separated string)
+    hotwords = " ".join(all_terms)
+
+    return initial_prompt, hotwords
+
+
+def transcribe_audio(
+    audio_files: dict,
+    bundle_dir: Path,
+    model_size: str = "large-v3",
+    cpu_threads: int | None = None,
+    initial_prompt: str | None = None,
+    hotwords: str | None = None
+) -> list[dict]:
     """Transcribe audio using faster-whisper on CPU with int8 quantization.
-    Supports multi-track transcription with isolated Host vs Remote channels and VAD filtering.
+    Supports multi-track transcription with isolated Host vs Remote channels, VAD filtering,
+    and client domain decoder biasing (initial_prompt and hotwords).
     """
     if model_size == "large":
         model_size = "large-v3"
     print("[3/5] TRANSCRIBING SPEECH WITH FASTER-WHISPER")
     thread_info = f" | CPU Threads: {cpu_threads}" if cpu_threads else ""
     print(f"      -> Engine: faster-whisper | Model: '{model_size}' | Quantization: int8 (CPU){thread_info}")
+    if initial_prompt or hotwords:
+        prompt_snippet = f" (Context: '{initial_prompt[:50]}...')" if initial_prompt else ""
+        print(f"      -> Decoder Biasing: Active{prompt_snippet}")
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -381,6 +468,16 @@ def transcribe_audio(audio_files: dict, bundle_dir: Path, model_size: str = "lar
     model = WhisperModel(model_size, **whisper_kwargs)
     print(f"      -> Model loaded in {time.time() - t_load:.2f}s.")
 
+    transcribe_kwargs = {
+        "beam_size": 5,
+        "vad_filter": True,
+        "vad_parameters": dict(min_silence_duration_ms=500),
+    }
+    if initial_prompt:
+        transcribe_kwargs["initial_prompt"] = initial_prompt
+    if hotwords:
+        transcribe_kwargs["hotwords"] = hotwords
+
     t0 = time.time()
     all_turns = []
     text_lines = []
@@ -392,9 +489,7 @@ def transcribe_audio(audio_files: dict, bundle_dir: Path, model_size: str = "lar
         sys.stdout.flush()
         remote_segments, _ = model.transcribe(
             str(remote_path),
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500)
+            **transcribe_kwargs
         )
         remote_turns = []
         for seg in remote_segments:
@@ -415,9 +510,7 @@ def transcribe_audio(audio_files: dict, bundle_dir: Path, model_size: str = "lar
         sys.stdout.flush()
         host_segments, _ = model.transcribe(
             str(host_path),
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500)
+            **transcribe_kwargs
         )
         host_turns = []
         for seg in host_segments:
@@ -445,9 +538,7 @@ def transcribe_audio(audio_files: dict, bundle_dir: Path, model_size: str = "lar
         audio_path = audio_files["master_wav"]
         segments, info = model.transcribe(
             str(audio_path),
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500)
+            **transcribe_kwargs
         )
         total_duration = max(1.0, info.duration)
         print(f"      -> Detected language: {info.language.upper()} (confidence: {info.language_probability:.2%})")
@@ -661,7 +752,9 @@ def extract_artifacts_parallel(
     audio_files: dict,
     model_size: str,
     profile: dict,
-    extract_1fps: bool = False
+    extract_1fps: bool = False,
+    initial_prompt: str | None = None,
+    hotwords: str | None = None
 ) -> list[dict]:
     """Execute Tier 1 visual extraction and audio transcription concurrently.
     Allocates distinct CPU cores and GPU media engines to prevent bottlenecks.
@@ -698,7 +791,9 @@ def extract_artifacts_parallel(
             audio_files,
             bundle_dir,
             model_size=model_size,
-            cpu_threads=profile["whisper_threads"]
+            cpu_threads=profile["whisper_threads"],
+            initial_prompt=initial_prompt,
+            hotwords=hotwords
         )
 
     # 3. Transcription finished -> Start Tier 2 Speaker Keyframes concurrently
@@ -766,7 +861,14 @@ def sanitize_mom_content(content: str) -> str:
     return result.strip()
 
 
-def invoke_antigravity(video_path: Path, bundle_dir: Path, output_dir: Path, speech_turns: list[dict] | None = None) -> Path:
+def invoke_antigravity(
+    video_path: Path,
+    bundle_dir: Path,
+    output_dir: Path,
+    speech_turns: list[dict] | None = None,
+    client_glossary: dict | None = None,
+    glossary_path: Path | None = None
+) -> Path:
     """Invoke Antigravity CLI (agy) to synthesize the full Minutes of Meeting."""
     print("[5/5] SYNTHESIZING MINUTES OF MEETING (ANTIGRAVITY AGENT)")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -804,6 +906,42 @@ CRITICAL PRINCIPLE 3 - DETERMINISTIC MULTI-TRACK SPEAKER ATTRIBUTION:
     else:
         instruction_2 = "2. Cross-reference speaker keyframes in \"speakers/\" (especially the opening frames) to identify attendee names, roles, and match spoken statements to specific individuals."
 
+    # Build client domain glossary prompt section if available
+    glossary_prompt_section = ""
+    if client_glossary and (client_glossary.get("terms") or client_glossary.get("hotwords")):
+        display_name = client_glossary.get("display_name", "Client Domain")
+        terms_lines = []
+        for t in client_glossary.get("terms", []):
+            if isinstance(t, dict) and t.get("canonical"):
+                desc = f": {t['description']}" if t.get("description") else ""
+                terms_lines.append(f"  * `{t['canonical']}`{desc}")
+        terms_text = "\n".join(terms_lines) if terms_lines else "  * None listed"
+        hotwords_list = client_glossary.get("hotwords", [])
+        hotwords_text = f"\n  * Additional hotwords: {', '.join(hotwords_list)}" if hotwords_list else ""
+
+        glossary_prompt_section = f"""
+CLIENT DOMAIN GLOSSARY ({display_name}):
+The following domain terms, acronyms, and product names are canonical for this meeting:
+{terms_text}{hotwords_text}
+
+CRITICAL TERMINOLOGY INSTRUCTIONS:
+- Ground truth terminology: The raw audio transcript may contain acoustic variations, informal spellings, or phonetic mishearings (e.g. mishearing proprietary names or acronyms). Always resolve and standardize these spoken terms to the exact canonical terminology in this glossary.
+- Never invent alternative spellings or acronym casings for canonical terms.
+"""
+
+    suggested_json_path = (bundle_dir / "suggested_terms.json").resolve().as_posix()
+    instruction_8 = f"""8. DISCOVERY OF CANDIDATE CLIENT TERMINOLOGY:
+   Identify any recurring client-specific acronyms, project names, or proprietary technical terms mentioned in the dialogue that are NOT listed in the CLIENT DOMAIN GLOSSARY.
+   Write these candidate terms as a JSON array to the artifact bundle path:
+   "{suggested_json_path}"
+   Format:
+   [
+     {{"term": "NovelAcronym", "context": "Brief explanation of how it was used in context"}}
+   ]
+   (If none detected, write [] to that file).
+   NEVER mention candidate terms, glossary files, or internal pipeline suggestions in the Minutes of Meeting document itself.
+"""
+
     # List visual frames
     slides = [f.name for f in sorted((bundle_dir / "slides").glob("*.jpg"))]
     speakers = [f.name for f in sorted((bundle_dir / "speakers").glob("*.jpg"))]
@@ -812,6 +950,9 @@ CRITICAL PRINCIPLE 3 - DETERMINISTIC MULTI-TRACK SPEAKER ATTRIBUTION:
     print(f"         * Transcript: {len(transcript_content)} chars (~{word_count} words)")
     if is_multi_track:
         print("         * Speaker Channels: Deterministic Multi-Track (Host vs. Remote Attendees)")
+    if client_glossary:
+        display_name = client_glossary.get("display_name", "Client")
+        print(f"         * Client Glossary: Active ({display_name})")
     print(f"         * Slide Frames: {len(slides)} transition images")
     print(f"         * Speaker Keyframes: {len(speakers)} utterance onset images")
     print(f"      -> Target MoM Document: {mom_file.name}")
@@ -847,6 +988,7 @@ CRITICAL PRINCIPLE 2 - IN-MEETING SCREENSHARE VS. LOCAL WORKSTATION RECORDING:
   * NEVER describe the recording host's unshared local desktop (e.g. IDEs, background browser tabs, AI assistants, query tools).
   * NEVER list internal image filenames (e.g. `slide_00-24-24.jpg`) or explain why an image was ignored.
 {multi_track_instructions}
+{glossary_prompt_section}
 MEETING RECORDING: "{video_path.name}"
 DATE: {date_str}
 
@@ -885,6 +1027,7 @@ YOUR INSTRUCTIONS:
    ## 5. Open Questions & Parked Topics
    Any unresolved items or questions deferred to future sessions.
 
+{instruction_8}
 Return ONLY the complete Markdown document, without conversational filler before or after.
 """
 
@@ -913,6 +1056,25 @@ Return ONLY the complete Markdown document, without conversational filler before
         print(f"[SUCCESS] Minutes of Meeting generated successfully!")
         print(f"Location: {mom_file.resolve()}")
         print(f"========================================================================\n")
+
+        # Check for suggested candidate terms in bundle
+        suggested_file = bundle_dir / "suggested_terms.json"
+        if suggested_file.is_file():
+            try:
+                with open(suggested_file, "r", encoding="utf-8") as f:
+                    suggestions = json.load(f)
+                if isinstance(suggestions, list) and len(suggestions) > 0:
+                    print("========================================================================")
+                    print("[*] Suggested Glossary Additions (Detected from meeting dialogue):")
+                    for item in suggestions:
+                        term = item.get("term", "")
+                        ctx = item.get("context", "")
+                        print(f"    - {term}: {ctx}")
+                    target_hint = f"'{glossary_path.as_posix()}'" if glossary_path else "docs/clients/default.json"
+                    print(f"\n    -> Easily add these to {target_hint} to improve future transcriptions.")
+                    print("========================================================================\n")
+            except Exception:
+                pass
     else:
         print(f"[!] Warning: No output returned from agy. Stderr: {res.stderr}")
 
@@ -939,6 +1101,9 @@ def main():
     parser.add_argument("--ffmpeg-threads", type=int, default=None, help="Explicit CPU threads for FFmpeg scene detection (default: auto-budgeted)")
     parser.add_argument("--speaker-workers", type=int, default=None, help="Concurrent worker threads for speaker frame extraction (default: auto-budgeted)")
     parser.add_argument("--hwaccel", default="auto", choices=["auto", "d3d11va", "dxva2", "qsv", "none"], help="FFmpeg video decode hardware acceleration (default: auto)")
+    parser.add_argument("--client", default="default", help="Client glossary profile name in docs/clients/ (default: 'default')")
+    parser.add_argument("--no-client", action="store_true", help="Disable client glossary loading and proceed with general vocabulary")
+    parser.add_argument("--clients-dir", default="docs/clients", help="Directory containing client profiles (default: docs/clients)")
 
     args = parser.parse_args()
 
@@ -946,6 +1111,11 @@ def main():
     recordings_dir = Path(args.recordings_dir).resolve()
     bundle_dir = (project_root / args.bundle_dir).resolve()
     output_dir = (project_root / args.output_dir).resolve()
+    clients_dir = (project_root / args.clients_dir).resolve()
+
+    client_name = None if args.no_client else args.client
+    client_glossary, glossary_path = load_client_glossary(client_name, clients_dir)
+    whisper_initial_prompt, whisper_hotwords = build_whisper_biasing_params(client_glossary)
 
     profile = get_hardware_profile(
         custom_whisper_threads=args.whisper_threads,
@@ -973,13 +1143,20 @@ def main():
     print(f" [TIME]   Total Length : {format_timestamp_colons(total_duration_sec)} ({total_duration_sec:.1f}s)")
     print(f" [DIR]    Artifacts    : {bundle_dir}")
     print(f" [DEST]   MoM Output   : {output_dir}")
+    print(f" [CLIENT] Glossary     : {glossary_path.name if glossary_path else 'None (Disabled)'}")
     print(f" [MODE]   Execution    : {'Sequential' if args.sequential else 'Parallel (Hardware-Optimized)'}")
     print("========================================================================\n")
 
     if args.synthesis_only:
         session_video = bundle_dir / "merged_session.mp4" if (bundle_dir / "merged_session.mp4").is_file() else video_paths[0]
         print("[*] --synthesis-only passed. Skipping all extraction and synthesizing MoM immediately...\n")
-        invoke_antigravity(session_video, bundle_dir, output_dir)
+        invoke_antigravity(
+            session_video,
+            bundle_dir,
+            output_dir,
+            client_glossary=client_glossary,
+            glossary_path=glossary_path
+        )
         return
 
     slides_dir = bundle_dir / "slides"
@@ -1030,7 +1207,9 @@ def main():
                 audio_files,
                 bundle_dir,
                 model_size=args.model,
-                cpu_threads=profile["whisper_threads"]
+                cpu_threads=profile["whisper_threads"],
+                initial_prompt=whisper_initial_prompt,
+                hotwords=whisper_hotwords
             )
             print("[4/5] EXTRACTING VISUAL ARTIFACTS (TWO-TIER)")
             extract_slide_frames(session_video, slides_dir, hwaccel=profile["hwaccel"], threads=profile["ffmpeg_threads"])
@@ -1044,7 +1223,9 @@ def main():
                 audio_files,
                 model_size=args.model,
                 profile=profile,
-                extract_1fps=args.extract_1fps
+                extract_1fps=args.extract_1fps,
+                initial_prompt=whisper_initial_prompt,
+                hotwords=whisper_hotwords
             )
 
     print("----------------------- Preprocessing Summary -----------------------")
@@ -1059,7 +1240,14 @@ def main():
     if args.skip_agent:
         print("[*] --skip-agent passed. Preprocessing complete. Skipping agent synthesis.")
     else:
-        invoke_antigravity(session_video, bundle_dir, output_dir, speech_turns=speech_turns)
+        invoke_antigravity(
+            session_video,
+            bundle_dir,
+            output_dir,
+            speech_turns=speech_turns,
+            client_glossary=client_glossary,
+            glossary_path=glossary_path
+        )
 
 
 if __name__ == "__main__":

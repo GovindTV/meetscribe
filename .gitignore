@@ -1,4 +1,4 @@
-﻿# Byte-compiled / optimized / DLL files
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -18,3 +18,12 @@ env/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Generated Minutes of Meeting (MoM) outputs
+docs/mom
+docs/mom/
+docs/mom/**
+
+# Client domain terminology profiles (protect proprietary client data)
+docs/clients/*.json
+!docs/clients/example.json

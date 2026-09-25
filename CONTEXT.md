@@ -68,3 +68,15 @@ _Avoid_: Split audio, channel dump, raw audio
 The designated physical audio stream identifying whether a speech turn originated from the local recording host or external remote call participants.
 _Avoid_: Voice channel, track name, audio source
 
+**Client Glossary**:
+A structured repository of canonical client terminology, domain definitions, and hotwords used to enforce vocabulary consistency across transcription and meeting synthesis.
+_Avoid_: Wordlist, dictionary, cheat sheet, vocab file
+
+**Decoder Biasing**:
+The conditioning of speech-to-text acoustic token prediction probabilities using initial prompts and hotwords during audio transcription.
+_Avoid_: Prompt hacking, prompt injection, Whisper seeding
+
+**Synthesis Glossary Grounding**:
+The injection of canonical client vocabulary and domain descriptions into the meeting synthesis prompt to resolve acoustic ambiguities and ensure accurate terminology in the MoM.
+_Avoid_: Prompt context, background notes, reference injection
+

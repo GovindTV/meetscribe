@@ -1,0 +1,21 @@
+{
+  "client_id": "example_client",
+  "display_name": "Example Client Corp",
+  "description": "Domain terminology and acronyms for Example Client meetings.",
+  "terms": [
+    {
+      "canonical": "AcmeNexus",
+      "description": "Internal developer portal and service catalog gateway."
+    },
+    {
+      "canonical": "ApolloSync",
+      "description": "Real-time distributed state synchronization microservice."
+    }
+  ],
+  "hotwords": [
+    "K8s",
+    "GraphQL",
+    "OAuth2",
+    "PostgreSQL"
+  ]
+}
