@@ -434,10 +434,79 @@ def build_whisper_biasing_params(glossary: dict | None) -> tuple[str | None, str
     return initial_prompt, hotwords
 
 
+def _stream_transcribe_channel(
+    model,
+    audio_path: Path,
+    channel_name: str,
+    channel_idx_str: str,
+    transcribe_kwargs: dict
+) -> tuple[list[dict], list[str]]:
+    """Transcribe an audio channel with physically measured progress tracking, speed calculation, and accurate ETAs."""
+    t_start = time.time()
+    segments, info = model.transcribe(str(audio_path), **transcribe_kwargs)
+    total_duration = max(1.0, info.duration)
+
+    print(f"      -> [{channel_idx_str}: {channel_name}] Audio: {audio_path.name} ({format_timestamp_colons(total_duration)} / {total_duration:.1f}s)")
+    print(f"         * Detected Language : {info.language.upper()} (confidence: {info.language_probability:.1%})")
+    print(f"         * Real-time decoding progress:")
+    sys.stdout.flush()
+
+    turns = []
+    text_lines = []
+
+    for seg in segments:
+        text = seg.text.strip()
+        if not text:
+            continue
+
+        start_str = format_timestamp_colons(seg.start)
+        end_str = format_timestamp_colons(seg.end)
+
+        turn = {
+            "start": round(seg.start, 2),
+            "end": round(seg.end, 2),
+            "timestamp": start_str,
+            "channel": channel_name,
+            "text": text,
+        }
+        turns.append(turn)
+        text_lines.append(f"[{start_str} -> {end_str}] [{channel_name}]: {text}")
+
+        # Physical audio progress based directly on decoded audio timestamp
+        pct = min(100.0, (seg.end / total_duration) * 100.0)
+        elapsed = time.time() - t_start
+        speed_x = seg.end / max(0.1, elapsed)
+        remaining_sec = max(0.0, total_duration - seg.end)
+        eta_sec = remaining_sec / max(0.01, speed_x)
+        eta_min = int(eta_sec // 60)
+        eta_sec_rem = int(eta_sec % 60)
+        eta_str = f"{eta_min:02d}m {eta_sec_rem:02d}s"
+
+        bar_len = 20
+        filled = int(bar_len * pct / 100.0)
+        bar = "=" * filled + (">" if filled < bar_len else "") + "." * max(0, bar_len - filled - (1 if filled < bar_len else 0))
+
+        snippet = text.replace("\n", " ")
+        if len(snippet) > 40:
+            snippet = snippet[:37] + "..."
+
+        sys.stdout.write(
+            f"\n      [{bar}] {pct:5.1f}% | #{len(turns):03d} [{start_str}/{format_timestamp_colons(total_duration)}] "
+            f"({speed_x:.2f}x | ETA {eta_str}) {snippet:<40}"
+        )
+        sys.stdout.flush()
+
+    sys.stdout.write("\n")
+    elapsed_total = time.time() - t_start
+    print(f"      -> [{channel_name}] Finished: {len(turns)} speech turns captured in {elapsed_total:.1f}s.\n")
+    sys.stdout.flush()
+    return turns, text_lines
+
+
 def transcribe_audio(
     audio_files: dict,
     bundle_dir: Path,
-    model_size: str = "large-v3",
+    model_size: str = "turbo",
     cpu_threads: int | None = None,
     initial_prompt: str | None = None,
     hotwords: str | None = None
@@ -448,6 +517,8 @@ def transcribe_audio(
     """
     if model_size == "large":
         model_size = "large-v3"
+    elif model_size in ("large-v3-turbo", "turbo"):
+        model_size = "turbo"
     print("[3/5] TRANSCRIBING SPEECH WITH FASTER-WHISPER")
     thread_info = f" | CPU Threads: {cpu_threads}" if cpu_threads else ""
     print(f"      -> Engine: faster-whisper | Model: '{model_size}' | Quantization: int8 (CPU){thread_info}")
@@ -484,46 +555,22 @@ def transcribe_audio(
 
     if audio_files.get("is_multi_track"):
         # 1. Transcribe Remote Attendees
-        remote_path = audio_files["remote_wav"]
-        print(f"      -> [Channel 1/2: Remote Attendees] Transcribing {remote_path.name} with VAD filtering...")
-        sys.stdout.flush()
-        remote_segments, _ = model.transcribe(
-            str(remote_path),
-            **transcribe_kwargs
+        remote_turns, _ = _stream_transcribe_channel(
+            model=model,
+            audio_path=audio_files["remote_wav"],
+            channel_name="Remote Attendee",
+            channel_idx_str="Channel 1/2",
+            transcribe_kwargs=transcribe_kwargs
         )
-        remote_turns = []
-        for seg in remote_segments:
-            text = seg.text.strip()
-            if text:
-                remote_turns.append({
-                    "start": round(seg.start, 2),
-                    "end": round(seg.end, 2),
-                    "timestamp": format_timestamp_colons(seg.start),
-                    "channel": "Remote Attendee",
-                    "text": text,
-                })
-        print(f"         * Remote Speech: {len(remote_turns)} speech turns captured.")
 
         # 2. Transcribe Host Microphone
-        host_path = audio_files["host_wav"]
-        print(f"      -> [Channel 2/2: Host Microphone] Transcribing {host_path.name} with VAD filtering...")
-        sys.stdout.flush()
-        host_segments, _ = model.transcribe(
-            str(host_path),
-            **transcribe_kwargs
+        host_turns, _ = _stream_transcribe_channel(
+            model=model,
+            audio_path=audio_files["host_wav"],
+            channel_name="Host",
+            channel_idx_str="Channel 2/2",
+            transcribe_kwargs=transcribe_kwargs
         )
-        host_turns = []
-        for seg in host_segments:
-            text = seg.text.strip()
-            if text:
-                host_turns.append({
-                    "start": round(seg.start, 2),
-                    "end": round(seg.end, 2),
-                    "timestamp": format_timestamp_colons(seg.start),
-                    "channel": "Host",
-                    "text": text,
-                })
-        print(f"         * Host Speech: {len(host_turns)} speech turns captured.")
 
         # 3. Merge chronologically
         merged_turns = sorted(remote_turns + host_turns, key=lambda t: t["start"])
@@ -535,41 +582,20 @@ def transcribe_audio(
             all_turns.append(turn)
             text_lines.append(f"[{start_str} -> {end_str}] {channel_tag}: {turn['text']}")
     else:
-        audio_path = audio_files["master_wav"]
-        segments, info = model.transcribe(
-            str(audio_path),
-            **transcribe_kwargs
+        single_turns, _ = _stream_transcribe_channel(
+            model=model,
+            audio_path=audio_files["master_wav"],
+            channel_name="Speaker",
+            channel_idx_str="Single Track",
+            transcribe_kwargs=transcribe_kwargs
         )
-        total_duration = max(1.0, info.duration)
-        print(f"      -> Detected language: {info.language.upper()} (confidence: {info.language_probability:.2%})")
-        print(f"      -> Audio duration: {format_timestamp_colons(total_duration)} ({total_duration:.1f}s)")
-        print("      -> Streaming transcript progress:")
-
-        for idx, seg in enumerate(segments):
-            start_str = format_timestamp_colons(seg.start)
-            end_str = format_timestamp_colons(seg.end)
-            turn = {
-                "id": idx,
-                "start": round(seg.start, 2),
-                "end": round(seg.end, 2),
-                "timestamp": start_str,
-                "channel": "Speaker",
-                "text": seg.text.strip(),
-            }
+        for idx, turn in enumerate(single_turns):
+            turn["id"] = idx
+            start_str = turn["timestamp"]
+            end_str = format_timestamp_colons(turn["end"])
+            channel_tag = f"[{turn['channel']}]"
             all_turns.append(turn)
-            text_lines.append(f"[{start_str} -> {end_str}] {seg.text.strip()}")
-
-            pct = min(100.0, (seg.end / total_duration) * 100.0)
-            bar_len = 22
-            filled = int(bar_len * pct / 100.0)
-            bar = "=" * filled + (">" if filled < bar_len else "") + "." * max(0, bar_len - filled - (1 if filled < bar_len else 0))
-            text_snippet = seg.text.strip().replace("\n", " ")
-            if len(text_snippet) > 42:
-                text_snippet = text_snippet[:39] + "..."
-            sys.stdout.write(f"\n      [{bar}] {pct:5.1f}% | #{idx+1:03d} [{start_str}] {text_snippet:<45}")
-            sys.stdout.flush()
-
-        sys.stdout.write("\n")
+            text_lines.append(f"[{start_str} -> {end_str}] {channel_tag}: {turn['text']}")
 
     elapsed = time.time() - t0
 
@@ -1084,7 +1110,12 @@ Return ONLY the complete Markdown document, without conversational filler before
 def main():
     parser = argparse.ArgumentParser(description="Video Recording to Minutes of Meeting (MoM) Pipeline")
     parser.add_argument("video_paths", nargs="*", default=None, help=r"Paths or glob pattern to meeting video recordings (default: latest session in D:\OBS Captures)")
-    parser.add_argument("--model", default="large-v3", choices=["tiny", "base", "small", "medium", "large", "large-v3"], help="Whisper model size (default: large-v3)")
+    parser.add_argument(
+        "--model",
+        default="turbo",
+        choices=["tiny", "base", "small", "medium", "large", "large-v3", "large-v3-turbo", "turbo"],
+        help="Whisper model size (default: turbo - full large-v3 accuracy, 4x faster on CPU)"
+    )
     parser.add_argument("--recordings-dir", default=r"D:\OBS Captures", help=r"Directory containing recordings (default: D:\OBS Captures)")
     parser.add_argument("--bundle-dir", default=".bundle", help="Temporary working directory for artifacts (default: .bundle)")
     parser.add_argument("--output-dir", default="docs/mom", help="Output directory for final MoM (default: docs/mom)")
