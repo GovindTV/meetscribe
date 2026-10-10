@@ -15,11 +15,24 @@ venv/
 .venv/
 env/
 
+# Environment secrets and credentials
+.env
+.env.*
+*.env
+
+# IDE and editor settings
+.vscode/
+.idea/
+
+# Test caches & temporary test directories
+.pytest_cache/
+tests/temp_*
+
 # OS metadata
 .DS_Store
 Thumbs.db
 
-# Generated Minutes of Meeting (MoM) outputs
+# Generated Minutes of Meeting (MoM) outputs (protect confidential meeting notes)
 docs/mom
 docs/mom/
 docs/mom/**
@@ -27,3 +40,17 @@ docs/mom/**
 # Client domain terminology profiles (protect proprietary client data)
 docs/clients/*.json
 !docs/clients/example.json
+
+# Audio and video meeting recordings (protect proprietary meeting media)
+recordings/*
+!recordings/synthetic_part1.mp4
+!recordings/synthetic_part2.mp4
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.wav
+*.aac
+*.m4a
+!recordings/synthetic_part1.mp4
+!recordings/synthetic_part2.mp4

@@ -80,3 +80,16 @@ _Avoid_: Prompt hacking, prompt injection, Whisper seeding
 The injection of canonical client vocabulary and domain descriptions into the meeting synthesis prompt to resolve acoustic ambiguities and ensure accurate terminology in the MoM.
 _Avoid_: Prompt context, background notes, reference injection
 
+**Team Roster**:
+The structured list of known project personnel and their official roles maintained within client profiles. Biases acoustic speech-to-text decoding and grounds synthesis disambiguation.
+_Avoid_: Staff list, employee directory, people list
+
+**Meeting Attendee**:
+A participant verified to have physically attended and actively engaged in the specific session via speaking turns on physical audio channels or visible speaker tiles/avatars.
+_Avoid_: Participant mention, meeting subject, called out member
+
+**Referenced Stakeholder**:
+An individual or colleague discussed in the third person during the meeting dialogue who was not physically present in the session. Must never be listed under Meeting Attendees.
+_Avoid_: Absent attendee, mentioned participant, passive member
+
+

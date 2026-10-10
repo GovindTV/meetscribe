@@ -1,7 +1,19 @@
 {
   "client_id": "example_client",
   "display_name": "Example Client Corp",
-  "description": "Domain terminology and acronyms for Example Client meetings.",
+  "description": "Domain terminology, team roster, and acronyms for Example Client meetings.",
+  "team": [
+    {
+      "name": "Alice Johnson",
+      "role": "Engineering Lead",
+      "aliases": ["Alice", "AJ"]
+    },
+    {
+      "name": "Bob Smith",
+      "role": "Data Engineer",
+      "aliases": ["Bob", "BS"]
+    }
+  ],
   "terms": [
     {
       "canonical": "AcmeNexus",
@@ -13,6 +25,8 @@
     }
   ],
   "hotwords": [
+    "Alice",
+    "Bob",
     "K8s",
     "GraphQL",
     "OAuth2",

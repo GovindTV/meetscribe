@@ -363,7 +363,14 @@ def get_default_glossary_template(client_id: str = "default") -> dict:
     return {
         "client_id": client_id,
         "display_name": "Default Client",
-        "description": "Client domain terminology and proprietary acronyms.",
+        "description": "Client domain terminology, team roster, and proprietary acronyms.",
+        "team": [
+            {
+                "name": "Example Person",
+                "role": "Software Engineer",
+                "aliases": ["Example", "EP"]
+            }
+        ],
         "terms": [
             {
                 "canonical": "ExampleTerm",
@@ -392,7 +399,7 @@ def load_client_glossary(client_name: str | None, clients_dir: Path) -> tuple[di
             with open(glossary_path, "w", encoding="utf-8") as f:
                 json.dump(template, f, indent=2)
             print(f"[*] CLIENT GLOSSARY: Auto-scaffolded starter profile at '{glossary_path.as_posix()}'.")
-            print(f"    -> Add your client's proprietary terms to this file to bias Whisper and MoM synthesis.\n")
+            print(f"    -> Add your client's proprietary terms and team roster to this file to bias Whisper and MoM synthesis.\n")
             return template, glossary_path
         else:
             print(f"[!] Warning: Client profile '{client_name}' not found at '{glossary_path}'. Proceeding without client glossary.\n")
@@ -401,11 +408,12 @@ def load_client_glossary(client_name: str | None, clients_dir: Path) -> tuple[di
     try:
         with open(glossary_path, "r", encoding="utf-8") as f:
             glossary = json.load(f)
+        team_count = len(glossary.get("team", []))
         terms_count = len(glossary.get("terms", []))
         hotwords_count = len(glossary.get("hotwords", []))
         display_name = glossary.get("display_name", client_name)
         print(f"[*] CLIENT GLOSSARY: Loaded '{display_name}' ({glossary_path.name})")
-        print(f"    -> {terms_count} canonical terms, {hotwords_count} hotwords loaded for decoder biasing & synthesis grounding.\n")
+        print(f"    -> {team_count} team members, {terms_count} canonical terms, {hotwords_count} hotwords loaded for decoder biasing & synthesis grounding.\n")
         return glossary, glossary_path
     except Exception as e:
         print(f"[!] Warning: Failed to parse client profile '{glossary_path}': {e}. Proceeding without client glossary.\n")
@@ -413,20 +421,28 @@ def load_client_glossary(client_name: str | None, clients_dir: Path) -> tuple[di
 
 
 def build_whisper_biasing_params(glossary: dict | None) -> tuple[str | None, str | None]:
-    """Compile canonical terms and hotwords into Whisper decoder biasing parameters."""
+    """Compile canonical terms, team members, and hotwords into Whisper decoder biasing parameters."""
     if not glossary:
         return None, None
+
+    team_names = []
+    for m in glossary.get("team", []):
+        if isinstance(m, dict) and m.get("name"):
+            team_names.append(m["name"].strip())
+            for a in m.get("aliases", []):
+                if isinstance(a, str) and a.strip() and len(a.strip()) > 1:
+                    team_names.append(a.strip())
 
     terms = [t["canonical"].strip() for t in glossary.get("terms", []) if isinstance(t, dict) and t.get("canonical")]
     hotwords_list = [h.strip() for h in glossary.get("hotwords", []) if isinstance(h, str) and h.strip()]
 
-    all_terms = list(dict.fromkeys(terms + hotwords_list))
+    all_terms = list(dict.fromkeys(team_names + terms + hotwords_list))
     if not all_terms:
         return None, None
 
     # Format initial_prompt context sentence (keeping within Whisper's ~224 token limit)
     terms_sample = ", ".join(all_terms[:40])
-    initial_prompt = f"Meeting discussion covering client domain terminology: {terms_sample}."
+    initial_prompt = f"Meeting discussion covering team members and domain terms: {terms_sample}."
 
     # Native hotwords argument in faster-whisper (space-separated string)
     hotwords = " ".join(all_terms)
@@ -928,9 +944,19 @@ CRITICAL PRINCIPLE 3 - DETERMINISTIC MULTI-TRACK SPEAKER ATTRIBUTION:
   * Deterministically attribute host commitments, remarks, and moderation to the host.
   * For `[Remote Attendee]` turns, correlate the turn timestamp with the corresponding images in "speakers/" (which capture the meeting window and active speaker tile at that exact second) to attribute each statement to specific attendees by name.
 """
-        instruction_2 = "2. Cross-reference speaker keyframes in \"speakers/\" (especially the opening frames) to identify attendee names, roles, and match spoken statements to specific individuals. Use the [Host] vs [Remote Attendee] channel tags in the transcript for deterministic separation of host vs remote attendees."
+        instruction_2 = (
+            "2. Cross-reference speaker keyframes in \"speakers/\" (especially the opening frames) and transcript channel tags "
+            "([Host] vs [Remote Attendee]) to identify attendee names and roles. "
+            "Verify that listed attendees actually attended and spoke. "
+            "Colleagues merely discussed in the third person (e.g. offline team members) must be placed under Referenced Stakeholders, NEVER under Meeting Attendees."
+        )
     else:
-        instruction_2 = "2. Cross-reference speaker keyframes in \"speakers/\" (especially the opening frames) to identify attendee names, roles, and match spoken statements to specific individuals."
+        instruction_2 = (
+            "2. Cross-reference speaker keyframes in \"speakers/\" (especially the opening frames) and transcript dialogue "
+            "to identify attendee names and roles. "
+            "Verify that listed attendees actually attended and spoke. "
+            "Colleagues merely discussed in the third person (e.g. offline team members) must be placed under Referenced Stakeholders, NEVER under Meeting Attendees."
+        )
 
     # Build client domain glossary prompt section if available
     glossary_prompt_section = ""
@@ -953,6 +979,45 @@ The following domain terms, acronyms, and product names are canonical for this m
 CRITICAL TERMINOLOGY INSTRUCTIONS:
 - Ground truth terminology: The raw audio transcript may contain acoustic variations, informal spellings, or phonetic mishearings (e.g. mishearing proprietary names or acronyms). Always resolve and standardize these spoken terms to the exact canonical terminology in this glossary.
 - Never invent alternative spellings or acronym casings for canonical terms.
+"""
+
+    # Build team roster prompt section if available
+    team_roster_section = ""
+    if client_glossary and client_glossary.get("team"):
+        display_name = client_glossary.get("display_name", "Client Project")
+        team_lines = []
+        for m in client_glossary["team"]:
+            if isinstance(m, dict) and m.get("name"):
+                role_str = f" - Role: {m.get('role')}" if m.get("role") else ""
+                aliases_str = f" [Aliases/Initials: {', '.join(m.get('aliases', []))}]" if m.get("aliases") else ""
+                team_lines.append(f"  * **{m['name']}**{role_str}{aliases_str}")
+        team_text = "\n".join(team_lines) if team_lines else "  * None listed"
+
+        team_roster_section = f"""
+KNOWN PROJECT TEAM ROSTER ({display_name}):
+The following team members are associated with this project:
+{team_text}
+"""
+
+    attendee_presence_principle = """
+CRITICAL PRINCIPLE 4 - STRICT ATTENDEE PRESENCE VS. REFERENCED THIRD PARTIES:
+- SUBSET & SHORT MEETING PRINCIPLE:
+  Meetings may be brief internal syncs, 1-on-1s, or technical checks with only a SUBSET of the team roster.
+  NEVER assume that everyone on the project roster attended the meeting.
+- MEETING ATTENDEES (PRESENT IN CALL):
+  * An individual may ONLY be listed under "Meeting Attendees" if they were PHYSICALLY PRESENT and actively participated in this specific session.
+  * Verified strictly by:
+    1. Active speaking turns on [Host] or [Remote Attendee] channels (conversing, presenting, or responding), OR
+    2. An active participant video tile, avatar, or initials in "speakers/" keyframes (e.g. AJ, BS).
+- REFERENCED STAKEHOLDERS (NOT PRESENT IN MEETING):
+  * If a team member or stakeholder was NOT in the call, but other participants discussed them or their work in the third person (e.g., "Alice flagged data differences", "I'll sync with Alice", "Bob requested an update"):
+    -> NEVER list them as a Meeting Attendee!
+    -> List them strictly under "Referenced Stakeholders (Not Present in Meeting)" with a brief note on why their work was discussed.
+- PHONETIC & ACOUSTIC NAME RESOLUTION (ZERO PHANTOM PERSONAS):
+  * Audio transcripts may contain acoustic mishearings of team names (e.g., mishearing "Alice" as "Ellis" or "Alex").
+  * Always cross-reference spoken names against the Known Project Team Roster and domain context.
+  * If an unfamiliar name appears in dialogue performing tasks known to be handled by a team member (e.g., "Ellis is validating the API" when Alice is validating the API), resolve it as an acoustic mishearing of that team member.
+  * NEVER hallucinate a new person or invent a phantom colleague (like "Ellis").
 """
 
     suggested_json_path = (bundle_dir / "suggested_terms.json").resolve().as_posix()
@@ -1014,6 +1079,8 @@ CRITICAL PRINCIPLE 2 - IN-MEETING SCREENSHARE VS. LOCAL WORKSTATION RECORDING:
   * NEVER describe the recording host's unshared local desktop (e.g. IDEs, background browser tabs, AI assistants, query tools).
   * NEVER list internal image filenames (e.g. `slide_00-24-24.jpg`) or explain why an image was ignored.
 {multi_track_instructions}
+{team_roster_section}
+{attendee_presence_principle}
 {glossary_prompt_section}
 MEETING RECORDING: "{video_path.name}"
 DATE: {date_str}
@@ -1035,7 +1102,10 @@ YOUR INSTRUCTIONS:
    # Minutes of Meeting: {video_path.stem.replace('_', ' ').title()}
    - **Date**: {date_str}
    - **Recording File**: `{video_path.name}`
-   - **Identified Attendees & Roles**: (List each person identified from speaker tiles/dialogue)
+   - **Meeting Attendees (Present in Call)**:
+     - **[Full Name]** ([Initials/Channel]): [Role & active meeting focus/responsibilities discussed in this call]
+   - **Referenced Stakeholders (Not Present in Meeting)**:
+     - **[Full Name]** ([Role]): [Context of why they were discussed in third person] (If no third parties were discussed, write: "None")
 
    ## 1. Executive Summary
    Concise summary of the meeting purpose, key milestones, and high-level outcomes.

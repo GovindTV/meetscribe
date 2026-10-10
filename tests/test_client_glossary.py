@@ -36,11 +36,15 @@ class TestClientGlossary(unittest.TestCase):
         template = get_default_glossary_template("custom_client")
         self.assertEqual(template["client_id"], "custom_client")
         self.assertIn("display_name", template)
+        self.assertIn("team", template)
         self.assertIn("terms", template)
         self.assertIn("hotwords", template)
+        self.assertIsInstance(template["team"], list)
         self.assertIsInstance(template["terms"], list)
         self.assertIsInstance(template["hotwords"], list)
+        self.assertGreater(len(template["team"]), 0)
         self.assertGreater(len(template["terms"]), 0)
+        self.assertIn("name", template["team"][0])
         self.assertIn("canonical", template["terms"][0])
 
     def test_02_load_glossary_autoscaffold_default(self):
@@ -97,6 +101,28 @@ class TestClientGlossary(unittest.TestCase):
         self.assertIn("OAuth2", initial_prompt)
 
         self.assertEqual(hotwords, "AcmeNexus ApolloSync K8s OAuth2")
+
+    def test_06b_build_whisper_biasing_params_with_team(self):
+        glossary = {
+            "team": [
+                {"name": "Alice Johnson", "aliases": ["Alice", "AJ"]},
+                {"name": "Bob Smith", "aliases": ["Bob", "BS"]}
+            ],
+            "terms": [
+                {"canonical": "AcmeNexus", "description": "Core API gateway"}
+            ],
+            "hotwords": ["K8s", "OAuth2"]
+        }
+        initial_prompt, hotwords = build_whisper_biasing_params(glossary)
+        self.assertIsNotNone(initial_prompt)
+        self.assertIn("Alice Johnson", initial_prompt)
+        self.assertIn("Bob", initial_prompt)
+        self.assertIn("AcmeNexus", initial_prompt)
+        self.assertIn("Alice Johnson", hotwords)
+        self.assertIn("Alice", hotwords)
+        self.assertIn("AJ", hotwords)
+        self.assertIn("AcmeNexus", hotwords)
+        self.assertIn("K8s", hotwords)
 
     def test_07_build_whisper_biasing_params_empty(self):
         prompt, hotwords = build_whisper_biasing_params(None)
