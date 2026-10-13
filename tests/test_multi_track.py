@@ -15,6 +15,7 @@ from process_meeting import (
     extract_audio,
     transcribe_audio,
     merge_split_recordings,
+    clean_repetitive_text,
 )
 
 
@@ -137,6 +138,21 @@ class TestMultiTrackPipeline(unittest.TestCase):
             self.assertFalse(extracted["is_multi_track"])
             self.assertTrue(extracted["master_wav"].is_file())
             self.assertIsNone(extracted["remote_wav"])
+
+    def test_06_clean_repetitive_text(self):
+        # Repetitive sentence/phrase loops
+        text1 = "So, right? So, right? So, right? So, right?"
+        self.assertEqual(clean_repetitive_text(text1), "So, right?")
+
+        text2 = "Sure, I can do that. Sure, I can do that. Sure, I can do that."
+        self.assertEqual(clean_repetitive_text(text2), "Sure, I can do that.")
+
+        text3 = "Thank you. Thank you. Thank you."
+        self.assertEqual(clean_repetitive_text(text3), "Thank you.")
+
+        # Single word loop
+        text4 = "yeah yeah yeah"
+        self.assertEqual(clean_repetitive_text(text4), "yeah")
 
 
 if __name__ == "__main__":

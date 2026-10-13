@@ -450,6 +450,20 @@ def build_whisper_biasing_params(glossary: dict | None) -> tuple[str | None, str
     return initial_prompt, hotwords
 
 
+def clean_repetitive_text(text: str) -> str:
+    """Clean repeating phrases, sentences, or looping tokens from speech turns."""
+    cleaned = text.strip()
+    # 1. Match repeated sentences or clauses ending in punctuation (.?!;)
+    cleaned = re.sub(r'([^.?!;]+[.?!;])(?:\s+\1){1,}', r'\1', cleaned, flags=re.IGNORECASE)
+    # 2. Match repeated comma-separated clauses (e.g. 'whether it\'s done, whether it\'s done,')
+    cleaned = re.sub(r'([^,]+,)(?:\s+\1){1,}', r'\1', cleaned, flags=re.IGNORECASE)
+    # 3. Match general repeating multi-word phrases (e.g. 'whether it\'s done whether it\'s done')
+    cleaned = re.sub(r'(\b(?:\w+\s+){1,8}\w+\b)(?:\s+\1){1,}', r'\1', cleaned, flags=re.IGNORECASE)
+    # 4. Match single words repeated 3 or more times (e.g. 'yeah yeah yeah' -> 'yeah')
+    cleaned = re.sub(r'\b(\w+)(?:\s+\1){2,}\b', r'\1', cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
 def _stream_transcribe_channel(
     model,
     audio_path: Path,
@@ -472,6 +486,9 @@ def _stream_transcribe_channel(
 
     for seg in segments:
         text = seg.text.strip()
+        if not text:
+            continue
+        text = clean_repetitive_text(text)
         if not text:
             continue
 
@@ -558,7 +575,15 @@ def transcribe_audio(
     transcribe_kwargs = {
         "beam_size": 5,
         "vad_filter": True,
-        "vad_parameters": dict(min_silence_duration_ms=500),
+        "vad_parameters": dict(
+            threshold=0.5,
+            min_speech_duration_ms=250,
+            min_silence_duration_ms=1000,
+            speech_pad_ms=400,
+        ),
+        "condition_on_previous_text": False,
+        "repetition_penalty": 1.2,
+        "no_repeat_ngram_size": 3,
     }
     if initial_prompt:
         transcribe_kwargs["initial_prompt"] = initial_prompt
