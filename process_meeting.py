@@ -1202,6 +1202,247 @@ Return ONLY the complete Markdown document, without conversational filler before
     return mom_file
 
 
+def open_path(path: Path | str) -> bool:
+    """Open a file or directory using the OS default application without blocking."""
+    try:
+        resolved = Path(path).resolve()
+        if not resolved.exists():
+            print(f"[!] Path does not exist: {resolved}")
+            return False
+        if sys.platform == "win32":
+            try:
+                os.startfile(str(resolved))
+            except OSError:
+                if resolved.is_file() and resolved.suffix.lower() in (".md", ".json", ".txt", ".csv", ".log"):
+                    subprocess.Popen(["notepad.exe", str(resolved)])
+                else:
+                    raise
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(resolved)])
+        else:
+            subprocess.Popen(["xdg-open", str(resolved)])
+        return True
+    except Exception as e:
+        print(f"[!] Could not open {path}: {e}")
+        return False
+
+
+def reveal_in_file_manager(path: Path | str) -> bool:
+    """Reveal a file or open a directory in the OS file explorer without blocking."""
+    try:
+        resolved = Path(path).resolve()
+        if not resolved.exists():
+            resolved = resolved.parent
+            if not resolved.exists():
+                print(f"[!] Path does not exist: {resolved}")
+                return False
+
+        if sys.platform == "win32":
+            if resolved.is_file():
+                subprocess.Popen(["explorer", f"/select,{resolved}"])
+            else:
+                os.startfile(str(resolved))
+        elif sys.platform == "darwin":
+            if resolved.is_file():
+                subprocess.Popen(["open", "-R", str(resolved)])
+            else:
+                subprocess.Popen(["open", str(resolved)])
+        else:
+            folder = resolved.parent if resolved.is_file() else resolved
+            subprocess.Popen(["xdg-open", str(folder)])
+        return True
+    except Exception as e:
+        print(f"[!] Could not reveal {path} in file manager: {e}")
+        return False
+
+
+def read_single_key(prompt: str = "") -> str:
+    """Read a single keypress without waiting for Enter if on an interactive Windows console,
+    or fallback to line-buffered input.
+    """
+    if prompt:
+        print(prompt, end="", flush=True)
+
+    if sys.platform == "win32" and sys.stdin.isatty():
+        try:
+            import msvcrt
+            ch = msvcrt.getwch()
+            # Handle Windows extended keys (e.g. arrow keys, function keys)
+            if ch in ("\x00", "\xe0"):
+                msvcrt.getwch()
+                return ""
+            if ch in ("\r", "\n"):
+                print()
+                return "ENTER"
+            if ch == "\x1b":
+                print()
+                return "ESC"
+            if ch in ("\b", "\t"):
+                return ""
+            print(ch)
+            return ch
+        except Exception:
+            pass
+
+    try:
+        line = sys.stdin.readline()
+        if not line:
+            return "EOF"
+        trimmed = line.strip()
+        if not trimmed:
+            return "ENTER"
+        return trimmed
+    except Exception:
+        return "EOF"
+
+
+def post_execution_menu(
+    mom_file: Path | None,
+    glossary_path: Path | None,
+    bundle_dir: Path,
+    output_dir: Path,
+    session_video: Path,
+    client_name: str | None = None,
+    clients_dir: Path | None = None,
+    speech_turns: list[dict] | None = None,
+) -> None:
+    """Interactive post-execution actions menu."""
+    current_mom_file = mom_file
+    current_glossary_path = glossary_path
+    if current_glossary_path is None and clients_dir:
+        default_profile = clients_dir / "default.json"
+        if default_profile.is_file():
+            current_glossary_path = default_profile
+
+    def print_menu():
+        mom_label = current_mom_file.name if (current_mom_file and current_mom_file.is_file()) else "(Not generated)"
+        glossary_label = current_glossary_path.name if (current_glossary_path and current_glossary_path.is_file()) else "default.json"
+        t_txt = bundle_dir / "transcript.txt"
+        t_json = bundle_dir / "transcript.json"
+        trans_label = t_txt.name if t_txt.is_file() else (t_json.name if t_json.is_file() else "(None)")
+
+        print("========================================================================")
+        print("                      POST-EXECUTION ACTIONS")
+        print("========================================================================")
+        print(f"  [1] or [O] Open MoM Document       : {mom_label}")
+        print(f"  [2] or [J] Open Client Glossary    : {glossary_label} (edit terms/team)")
+        print(f"  [3] or [T] Open Transcript         : {trans_label}")
+        print(f"  [4] or [F] Reveal in File Explorer : {output_dir.name}\\")
+        print(f"  [5] or [R] Re-synthesize MoM       : Re-run AI scribe with updated glossary")
+        print(f"  [6] or [B] Open Artifact Bundle    : {bundle_dir.name}\\ (slides, speakers)")
+        print(f"  [C] or [Q] Close / Exit")
+        print("========================================================================")
+
+    print_menu()
+
+    try:
+        while True:
+            key = read_single_key("Press a key [1-6, C]: ")
+            norm = key.strip().lower()
+
+            if not norm:
+                continue
+
+            if norm in ("c", "q", "exit", "close", "esc", "eof", "enter", "7", "0"):
+                print("[*] Exiting. Have a great day!\n")
+                break
+
+            if norm in ("1", "o", "m"):
+                if current_mom_file and current_mom_file.is_file():
+                    print(f"--> Opening Minutes of Meeting: {current_mom_file.resolve()}")
+                    open_path(current_mom_file)
+                else:
+                    print("[!] MoM document has not been generated yet. Press [5] to synthesize now.")
+                print("\nPress [1] MoM, [2] Glossary, [3] Transcript, [4] Folder, [5] Re-synthesize, [C] Close: ", end="", flush=True)
+
+            elif norm in ("2", "j", "g"):
+                target = current_glossary_path
+                if not target or not target.is_file():
+                    if clients_dir:
+                        clients_dir.mkdir(parents=True, exist_ok=True)
+                        target = clients_dir / "default.json"
+                        if not target.is_file():
+                            tmpl = get_default_glossary_template(client_name or "default")
+                            with open(target, "w", encoding="utf-8") as f:
+                                json.dump(tmpl, f, indent=2)
+                        current_glossary_path = target
+
+                if target and target.is_file():
+                    print(f"--> Opening Client Glossary: {target.resolve()}")
+                    open_path(target)
+                    print("    Tip: Make your edits in your editor, save the file, then press [5] here to re-synthesize!")
+                else:
+                    print("[!] Could not find or create client glossary file.")
+                print("\nPress [1] MoM, [2] Glossary, [3] Transcript, [4] Folder, [5] Re-synthesize, [C] Close: ", end="", flush=True)
+
+            elif norm in ("3", "t"):
+                t_txt = bundle_dir / "transcript.txt"
+                t_json = bundle_dir / "transcript.json"
+                if t_txt.is_file():
+                    print(f"--> Opening Transcript: {t_txt.resolve()}")
+                    open_path(t_txt)
+                elif t_json.is_file():
+                    print(f"--> Opening Transcript JSON: {t_json.resolve()}")
+                    open_path(t_json)
+                else:
+                    print("[!] No transcript file found in bundle.")
+                print("\nPress [1] MoM, [2] Glossary, [3] Transcript, [4] Folder, [5] Re-synthesize, [C] Close: ", end="", flush=True)
+
+            elif norm in ("4", "f", "e"):
+                target = current_mom_file if (current_mom_file and current_mom_file.is_file()) else output_dir
+                print(f"--> Revealing in File Explorer: {target.resolve()}")
+                reveal_in_file_manager(target)
+                print("\nPress [1] MoM, [2] Glossary, [3] Transcript, [4] Folder, [5] Re-synthesize, [C] Close: ", end="", flush=True)
+
+            elif norm in ("5", "r", "s"):
+                print("\n[*] Reloading client glossary and re-synthesizing MoM...")
+                reloaded_glossary = None
+                reloaded_path = current_glossary_path
+                if clients_dir:
+                    cname = client_name if client_name else ("default" if current_glossary_path else None)
+                    reloaded_glossary, reloaded_path = load_client_glossary(cname, clients_dir)
+                    current_glossary_path = reloaded_path or current_glossary_path
+
+                turns = speech_turns
+                if turns is None and (bundle_dir / "transcript.json").is_file():
+                    try:
+                        with open(bundle_dir / "transcript.json", "r", encoding="utf-8") as f:
+                            turns = json.load(f)
+                    except Exception:
+                        pass
+
+                current_mom_file = invoke_antigravity(
+                    session_video,
+                    bundle_dir,
+                    output_dir,
+                    speech_turns=turns,
+                    client_glossary=reloaded_glossary,
+                    glossary_path=current_glossary_path
+                )
+                print("\n========================================================================")
+                print(f"[SUCCESS] MoM re-synthesized: {current_mom_file.resolve()}")
+                print("========================================================================\n")
+                print_menu()
+
+            elif norm in ("6", "b", "a"):
+                print(f"--> Opening Artifact Bundle: {bundle_dir.resolve()}")
+                reveal_in_file_manager(bundle_dir)
+                print("\nPress [1] MoM, [2] Glossary, [3] Transcript, [4] Folder, [5] Re-synthesize, [C] Close: ", end="", flush=True)
+
+            elif norm in ("?", "h", "help"):
+                print()
+                print_menu()
+
+            else:
+                print(f"[!] Unrecognized option '{key}'. Press [?] for menu or [C] to close.")
+                print("Press [1] MoM, [2] Glossary, [3] Transcript, [4] Folder, [5] Re-synthesize, [C] Close: ", end="", flush=True)
+
+    except KeyboardInterrupt:
+        print("\n[*] Exiting. Have a great day!\n")
+    except EOFError:
+        print("\n[*] Exiting.\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Video Recording to Minutes of Meeting (MoM) Pipeline")
     parser.add_argument("video_paths", nargs="*", default=None, help=r"Paths or glob pattern to meeting video recordings (default: latest session in D:\OBS Captures)")
@@ -1230,8 +1471,10 @@ def main():
     parser.add_argument("--client", default="default", help="Client glossary profile name in docs/clients/ (default: 'default')")
     parser.add_argument("--no-client", action="store_true", help="Disable client glossary loading and proceed with general vocabulary")
     parser.add_argument("--clients-dir", default="docs/clients", help="Directory containing client profiles (default: docs/clients)")
+    parser.add_argument("--no-interactive", action="store_true", help="Skip interactive post-execution actions menu and exit immediately")
 
     args = parser.parse_args()
+    interactive_allowed = sys.stdin.isatty() and not args.no_interactive
 
     project_root = Path(__file__).resolve().parent
     recordings_dir = Path(args.recordings_dir).resolve()
@@ -1276,13 +1519,33 @@ def main():
     if args.synthesis_only:
         session_video = bundle_dir / "merged_session.mp4" if (bundle_dir / "merged_session.mp4").is_file() else video_paths[0]
         print("[*] --synthesis-only passed. Skipping all extraction and synthesizing MoM immediately...\n")
-        invoke_antigravity(
+        cached_transcript = bundle_dir / "transcript.json"
+        speech_turns = None
+        if cached_transcript.is_file():
+            try:
+                with open(cached_transcript, "r", encoding="utf-8") as f:
+                    speech_turns = json.load(f)
+            except Exception:
+                pass
+        mom_file = invoke_antigravity(
             session_video,
             bundle_dir,
             output_dir,
+            speech_turns=speech_turns,
             client_glossary=client_glossary,
             glossary_path=glossary_path
         )
+        if interactive_allowed:
+            post_execution_menu(
+                mom_file=mom_file,
+                glossary_path=glossary_path,
+                bundle_dir=bundle_dir,
+                output_dir=output_dir,
+                session_video=session_video,
+                client_name=client_name,
+                clients_dir=clients_dir,
+                speech_turns=speech_turns
+            )
         return
 
     slides_dir = bundle_dir / "slides"
@@ -1363,16 +1626,29 @@ def main():
     print("---------------------------------------------------------------------\n")
 
     # 5. Antigravity Agent Synthesis
+    mom_file = None
     if args.skip_agent:
         print("[*] --skip-agent passed. Preprocessing complete. Skipping agent synthesis.")
     else:
-        invoke_antigravity(
+        mom_file = invoke_antigravity(
             session_video,
             bundle_dir,
             output_dir,
             speech_turns=speech_turns,
             client_glossary=client_glossary,
             glossary_path=glossary_path
+        )
+
+    if interactive_allowed:
+        post_execution_menu(
+            mom_file=mom_file,
+            glossary_path=glossary_path,
+            bundle_dir=bundle_dir,
+            output_dir=output_dir,
+            session_video=session_video,
+            client_name=client_name,
+            clients_dir=clients_dir,
+            speech_turns=speech_turns
         )
 
 

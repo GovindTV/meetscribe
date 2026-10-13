@@ -59,15 +59,15 @@ if "%~1"=="" (
     python process_meeting.py %*
 )
 
-echo.
-echo ========================================================
 if %ERRORLEVEL% equ 0 (
-    echo [SUCCESS] Meeting processing complete!
-    echo Your generated Minutes of Meeting is in: docs\mom\
+    exit /b 0
 ) else (
+    echo.
+    echo ========================================================
     echo [NOTICE] Process finished with exit code %ERRORLEVEL%.
     echo Check any messages above.
+    echo ========================================================
+    echo.
+    pause
+    exit /b %ERRORLEVEL%
 )
-echo ========================================================
-echo.
-pause

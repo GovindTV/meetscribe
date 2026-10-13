@@ -218,6 +218,35 @@ Location: D:\MoM\docs\mom\2026-09-09_MyMeeting.md
 ========================================================================
 ```
 
+### 🎮 Interactive Actions Menu (Instant Keyboard Shortcuts)
+
+At the end of execution, an interactive actions menu appears directly in your terminal. You can press a single key to immediately perform convenient actions:
+
+```
+========================================================================
+                      POST-EXECUTION ACTIONS
+========================================================================
+  [1] or [O] Open MoM Document       : 2026-10-13_12-03-36.md
+  [2] or [J] Open Client Glossary    : default.json (edit terms/team)
+  [3] or [T] Open Transcript         : transcript.txt
+  [4] or [F] Reveal in File Explorer : docs\mom\
+  [5] or [R] Re-synthesize MoM       : Re-run AI scribe with updated glossary
+  [6] or [B] Open Artifact Bundle    : .bundle\ (slides, speakers)
+  [C] or [Q] Close / Exit
+========================================================================
+Press a key [1-6, C]: 
+```
+
+| Key | Action | Description |
+| :---: | :--- | :--- |
+| **`1`** or **`O`** | **Open MoM Document** | Opens the generated `.md` file directly in your default editor (VS Code, Notepad, Obsidian). |
+| **`2`** or **`J`** | **Open Client Glossary JSON** | Opens `docs/clients/<client>.json` to quickly add new terms, definitions, or update the team roster. |
+| **`3`** or **`T`** | **Open Raw Transcript** | Opens `.bundle/transcript.txt` to view full timestamped speech turns. |
+| **`4`** or **`F`** | **Reveal in File Explorer** | Opens Windows File Explorer highlighting the generated MoM file in `docs/mom/`. |
+| **`5`** or **`R`** | **Re-synthesize MoM** | Reloads your glossary edits and re-runs AI synthesis immediately without re-transcribing audio. |
+| **`6`** or **`B`** | **Open Artifact Bundle** | Opens the `.bundle/` folder to inspect slide images and speaker keyframes. |
+| **`C`** / **`Q`** / **`Enter`** | **Close / Exit** | Closes the menu and cleanly exits the window. |
+
 ---
 
 ## 📂 Where Are My Meeting Notes?
@@ -301,6 +330,7 @@ If you record your meetings using **OBS Studio**, you can optionally configure a
 | **Change the recordings folder** | If your videos are in a different folder:<br>`python process_meeting.py --recordings-dir "C:\MyRecordings"` |
 | **Re-run AI summary without waiting to transcribe again** | If you already transcribed a video and just want to re-generate the notes:<br>`python process_meeting.py --reuse-transcript` |
 | **Only run the AI step** | Skip all media cutting and jump straight to writing:<br>`python process_meeting.py --synthesis-only` |
+| **Run non-interactively (scripts / CI)** | Skip post-execution interactive actions prompt:<br>`python process_meeting.py --no-interactive` |
 
 ---
 
