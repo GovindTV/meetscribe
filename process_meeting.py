@@ -420,9 +420,12 @@ def load_client_glossary(client_name: str | None, clients_dir: Path) -> tuple[di
         return None, None
 
 
-def build_whisper_biasing_params(glossary: dict | None) -> tuple[str | None, str | None]:
+def build_whisper_biasing_params(glossary: dict | None, language: str | None = None) -> tuple[str | None, str | None]:
     """Compile canonical terms, team members, and hotwords into Whisper decoder biasing parameters."""
+    is_hindi = bool(language and language.strip().lower() in ("hi", "hindi"))
     if not glossary:
+        if is_hindi:
+            return "यह मीटिंग हिंदी और अंग्रेज़ी में है (Hinglish discussion covering project engineering, deliverables, and updates).", None
         return None, None
 
     team_names = []
@@ -438,11 +441,16 @@ def build_whisper_biasing_params(glossary: dict | None) -> tuple[str | None, str
 
     all_terms = list(dict.fromkeys(team_names + terms + hotwords_list))
     if not all_terms:
+        if is_hindi:
+            return "यह मीटिंग हिंदी और अंग्रेज़ी में है (Hinglish discussion covering project engineering, deliverables, and updates).", None
         return None, None
 
     # Format initial_prompt context sentence (keeping within Whisper's ~224 token limit)
     terms_sample = ", ".join(all_terms[:40])
-    initial_prompt = f"Meeting discussion covering team members and domain terms: {terms_sample}."
+    if is_hindi:
+        initial_prompt = f"यह मीटिंग हिंदी और अंग्रेज़ी में है (Hinglish discussion). Domain terms and team members: {terms_sample}."
+    else:
+        initial_prompt = f"Meeting discussion covering team members and domain terms: {terms_sample}."
 
     # Native hotwords argument in faster-whisper (space-separated string)
     hotwords = " ".join(all_terms)
@@ -453,8 +461,8 @@ def build_whisper_biasing_params(glossary: dict | None) -> tuple[str | None, str
 def clean_repetitive_text(text: str) -> str:
     """Clean repeating phrases, sentences, or looping tokens from speech turns."""
     cleaned = text.strip()
-    # 1. Match repeated sentences or clauses ending in punctuation (.?!;)
-    cleaned = re.sub(r'([^.?!;]+[.?!;])(?:\s+\1){1,}', r'\1', cleaned, flags=re.IGNORECASE)
+    # 1. Match repeated sentences or clauses ending in punctuation (.?!; and Hindi । ॥)
+    cleaned = re.sub(r'([^.?!;।॥]+[.?!;।॥])(?:\s+\1){1,}', r'\1', cleaned, flags=re.IGNORECASE)
     # 2. Match repeated comma-separated clauses (e.g. 'whether it\'s done, whether it\'s done,')
     cleaned = re.sub(r'([^,]+,)(?:\s+\1){1,}', r'\1', cleaned, flags=re.IGNORECASE)
     # 3. Match general repeating multi-word phrases (e.g. 'whether it\'s done whether it\'s done')
@@ -477,7 +485,11 @@ def _stream_transcribe_channel(
     total_duration = max(1.0, info.duration)
 
     print(f"      -> [{channel_idx_str}: {channel_name}] Audio: {audio_path.name} ({format_timestamp_colons(total_duration)} / {total_duration:.1f}s)")
-    print(f"         * Detected Language : {info.language.upper()} (confidence: {info.language_probability:.1%})")
+    if transcribe_kwargs.get("language"):
+        task_str = transcribe_kwargs.get("task", "transcribe")
+        print(f"         * Configured Language: {transcribe_kwargs['language'].upper()} (Task: {task_str})")
+    else:
+        print(f"         * Detected Language : {info.language.upper()} (confidence: {info.language_probability:.1%})")
     print(f"         * Real-time decoding progress:")
     sys.stdout.flush()
 
@@ -542,11 +554,13 @@ def transcribe_audio(
     model_size: str = "turbo",
     cpu_threads: int | None = None,
     initial_prompt: str | None = None,
-    hotwords: str | None = None
+    hotwords: str | None = None,
+    language: str | None = None,
+    task: str = "transcribe",
 ) -> list[dict]:
     """Transcribe audio using faster-whisper on CPU with int8 quantization.
     Supports multi-track transcription with isolated Host vs Remote channels, VAD filtering,
-    and client domain decoder biasing (initial_prompt and hotwords).
+    client domain decoder biasing (initial_prompt and hotwords), and multilingual/Hinglish options.
     """
     if model_size == "large":
         model_size = "large-v3"
@@ -554,7 +568,9 @@ def transcribe_audio(
         model_size = "turbo"
     print("[3/5] TRANSCRIBING SPEECH WITH FASTER-WHISPER")
     thread_info = f" | CPU Threads: {cpu_threads}" if cpu_threads else ""
-    print(f"      -> Engine: faster-whisper | Model: '{model_size}' | Quantization: int8 (CPU){thread_info}")
+    lang_info = f" | Language: '{language}'" if language else " | Language: Auto-detect"
+    task_info = f" | Task: '{task}'" if task != "transcribe" else ""
+    print(f"      -> Engine: faster-whisper | Model: '{model_size}' | Quantization: int8 (CPU){thread_info}{lang_info}{task_info}")
     if initial_prompt or hotwords:
         prompt_snippet = f" (Context: '{initial_prompt[:50]}...')" if initial_prompt else ""
         print(f"      -> Decoder Biasing: Active{prompt_snippet}")
@@ -585,6 +601,10 @@ def transcribe_audio(
         "repetition_penalty": 1.2,
         "no_repeat_ngram_size": 3,
     }
+    if language:
+        transcribe_kwargs["language"] = language
+    if task:
+        transcribe_kwargs["task"] = task
     if initial_prompt:
         transcribe_kwargs["initial_prompt"] = initial_prompt
     if hotwords:
@@ -821,7 +841,9 @@ def extract_artifacts_parallel(
     profile: dict,
     extract_1fps: bool = False,
     initial_prompt: str | None = None,
-    hotwords: str | None = None
+    hotwords: str | None = None,
+    language: str | None = None,
+    task: str = "transcribe",
 ) -> list[dict]:
     """Execute Tier 1 visual extraction and audio transcription concurrently.
     Allocates distinct CPU cores and GPU media engines to prevent bottlenecks.
@@ -860,7 +882,9 @@ def extract_artifacts_parallel(
             model_size=model_size,
             cpu_threads=profile["whisper_threads"],
             initial_prompt=initial_prompt,
-            hotwords=hotwords
+            hotwords=hotwords,
+            language=language,
+            task=task,
         )
 
     # 3. Transcription finished -> Start Tier 2 Speaker Keyframes concurrently
@@ -934,7 +958,8 @@ def invoke_antigravity(
     output_dir: Path,
     speech_turns: list[dict] | None = None,
     client_glossary: dict | None = None,
-    glossary_path: Path | None = None
+    glossary_path: Path | None = None,
+    language: str | None = None,
 ) -> Path:
     """Invoke Antigravity CLI (agy) to synthesize the full Minutes of Meeting."""
     print("[5/5] SYNTHESIZING MINUTES OF MEETING (ANTIGRAVITY AGENT)")
@@ -1085,6 +1110,16 @@ CRITICAL PRINCIPLE 4 - STRICT ATTENDEE PRESENCE VS. REFERENCED THIRD PARTIES:
     else:
         transcript_prompt_section = f"FULL AUDIO TRANSCRIPTION:\n{transcript_content}"
 
+    bilingual_principle = """
+CRITICAL PRINCIPLE 5 - BILINGUAL & CODE-SWITCHED SPEECH (HINDI & ENGLISH):
+- The meeting transcript may contain dialogue in Hindi, English, or mixed Hindi-English (Hinglish / code-switching in Devanagari or Latin script).
+- Synthesize the entire Minutes of Meeting strictly in professional, executive-standard English.
+- Accurately translate all Hindi discussion points, arguments, architectural details, and decisions into clear, fluent English.
+- Preserve exact technical terminology, database table names, APIs, architecture, code names, and tools (e.g. Snowflake, Python, SQL, Jira, PRs, schema, endpoints) without altering or back-translating technical jargon.
+- Apply strict silent omission to Hindi and Hinglish informal pleasantries, conversational filler, greetings, and small talk (e.g., 'kya haal hai', 'theek hai', 'chai-paani', commute, weather) with zero meta-commentary.
+- Map any attendee or stakeholder names spoken in Hindi or transcribed in Devanagari/phonetic script back to their canonical English names from the Known Project Team Roster.
+"""
+
     prompt = f"""You are an executive scribe synthesizing the definitive Minutes of Meeting (MoM) from a recorded video session.
 
 CRITICAL PRINCIPLE 1 - STRICT SILENT OMISSION & ZERO META-COMMENTARY:
@@ -1106,6 +1141,7 @@ CRITICAL PRINCIPLE 2 - IN-MEETING SCREENSHARE VS. LOCAL WORKSTATION RECORDING:
 {multi_track_instructions}
 {team_roster_section}
 {attendee_presence_principle}
+{bilingual_principle}
 {glossary_prompt_section}
 MEETING RECORDING: "{video_path.name}"
 DATE: {date_str}
@@ -1305,6 +1341,7 @@ def post_execution_menu(
     client_name: str | None = None,
     clients_dir: Path | None = None,
     speech_turns: list[dict] | None = None,
+    language: str | None = None,
 ) -> None:
     """Interactive post-execution actions menu."""
     current_mom_file = mom_file
@@ -1417,7 +1454,8 @@ def post_execution_menu(
                     output_dir,
                     speech_turns=turns,
                     client_glossary=reloaded_glossary,
-                    glossary_path=current_glossary_path
+                    glossary_path=current_glossary_path,
+                    language=language
                 )
                 print("\n========================================================================")
                 print(f"[SUCCESS] MoM re-synthesized: {current_mom_file.resolve()}")
@@ -1452,6 +1490,17 @@ def main():
         choices=["tiny", "base", "small", "medium", "large", "large-v3", "large-v3-turbo", "turbo"],
         help="Whisper model size (default: turbo - full large-v3 accuracy, 4x faster on CPU)"
     )
+    parser.add_argument(
+        "--language",
+        default=None,
+        help="Spoken audio language code (e.g. 'hi' for Hindi/Hinglish, 'en' for English). Default: auto-detect"
+    )
+    parser.add_argument(
+        "--task",
+        default="transcribe",
+        choices=["transcribe", "translate"],
+        help="Whisper task: 'transcribe' (default: transcribes speech directly; recommended with agent synthesis) or 'translate' (translates to English during decoding)"
+    )
     parser.add_argument("--recordings-dir", default=r"D:\OBS Captures", help=r"Directory containing recordings (default: D:\OBS Captures)")
     parser.add_argument("--bundle-dir", default=".bundle", help="Temporary working directory for artifacts (default: .bundle)")
     parser.add_argument("--output-dir", default="docs/mom", help="Output directory for final MoM (default: docs/mom)")
@@ -1484,7 +1533,7 @@ def main():
 
     client_name = None if args.no_client else args.client
     client_glossary, glossary_path = load_client_glossary(client_name, clients_dir)
-    whisper_initial_prompt, whisper_hotwords = build_whisper_biasing_params(client_glossary)
+    whisper_initial_prompt, whisper_hotwords = build_whisper_biasing_params(client_glossary, language=args.language)
 
     profile = get_hardware_profile(
         custom_whisper_threads=args.whisper_threads,
@@ -1512,6 +1561,7 @@ def main():
     print(f" [TIME]   Total Length : {format_timestamp_colons(total_duration_sec)} ({total_duration_sec:.1f}s)")
     print(f" [DIR]    Artifacts    : {bundle_dir}")
     print(f" [DEST]   MoM Output   : {output_dir}")
+    print(f" [LANG]   Language     : {args.language.upper() if args.language else 'Auto-detect'} (Task: {args.task})")
     print(f" [CLIENT] Glossary     : {glossary_path.name if glossary_path else 'None (Disabled)'}")
     print(f" [MODE]   Execution    : {'Sequential' if args.sequential else 'Parallel (Hardware-Optimized)'}")
     print("========================================================================\n")
@@ -1533,7 +1583,8 @@ def main():
             output_dir,
             speech_turns=speech_turns,
             client_glossary=client_glossary,
-            glossary_path=glossary_path
+            glossary_path=glossary_path,
+            language=args.language,
         )
         if interactive_allowed:
             post_execution_menu(
@@ -1544,7 +1595,8 @@ def main():
                 session_video=session_video,
                 client_name=client_name,
                 clients_dir=clients_dir,
-                speech_turns=speech_turns
+                speech_turns=speech_turns,
+                language=args.language,
             )
         return
 
@@ -1598,7 +1650,9 @@ def main():
                 model_size=args.model,
                 cpu_threads=profile["whisper_threads"],
                 initial_prompt=whisper_initial_prompt,
-                hotwords=whisper_hotwords
+                hotwords=whisper_hotwords,
+                language=args.language,
+                task=args.task,
             )
             print("[4/5] EXTRACTING VISUAL ARTIFACTS (TWO-TIER)")
             extract_slide_frames(session_video, slides_dir, hwaccel=profile["hwaccel"], threads=profile["ffmpeg_threads"])
@@ -1614,7 +1668,9 @@ def main():
                 profile=profile,
                 extract_1fps=args.extract_1fps,
                 initial_prompt=whisper_initial_prompt,
-                hotwords=whisper_hotwords
+                hotwords=whisper_hotwords,
+                language=args.language,
+                task=args.task,
             )
 
     print("----------------------- Preprocessing Summary -----------------------")
@@ -1636,7 +1692,8 @@ def main():
             output_dir,
             speech_turns=speech_turns,
             client_glossary=client_glossary,
-            glossary_path=glossary_path
+            glossary_path=glossary_path,
+            language=args.language,
         )
 
     if interactive_allowed:
@@ -1648,7 +1705,8 @@ def main():
             session_video=session_video,
             client_name=client_name,
             clients_dir=clients_dir,
-            speech_turns=speech_turns
+            speech_turns=speech_turns,
+            language=args.language,
         )
 
 
